@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-PDFCrack Pro — Professional PDF Password Recovery Tool
+PDF Password Cracker Tool
+=========================
+A Python-based tool to recover passwords from encrypted PDF files.
+Uses multiple attack strategies like dictionary, brute-force, hybrid, and rule-based attacks.
 
-Supports dictionary, brute-force, hybrid, and rule-based attacks
-with multithreaded execution, live progress, and early termination.
+Author: phantom16
+Date: January 2026
 
 Requirements:
     pip install pikepdf rich
 """
 
-__version__ = "3.0.0"
-__author__ = "PDFCrack Pro"
+__version__ = "1.0.0"
+__author__ = "phantom16"
 
+# --- Standard library imports ---
 import sys
 import os
 import time
@@ -22,11 +26,13 @@ import argparse
 import threading
 from itertools import product
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-from typing import Optional, Iterator, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- Third-party imports ---
 import pikepdf
 
+# Try importing rich for better terminal output
+# If not installed, the tool will still work with plain text output
 try:
     from rich.console import Console
     from rich.progress import (
@@ -40,39 +46,54 @@ try:
 except ImportError:
     RICH_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
+# ===========================
+# Configuration / Constants
+# ===========================
+
+# ASCII art banner displayed when the tool runs
 BANNER = r"""
-  ____  ____  _____ ____                _      ____
- |  _ \|  _ \|  ___/ ___|_ __ __ _  ___| | __ |  _ \ _ __ ___
- | |_) | | | | |_ | |   | '__/ _` |/ __| |/ / | |_) | '__/ _ \
- |  __/| |_| |  _|| |___| | | (_| | (__|   <  |  __/| | | (_) |
- |_|   |____/|_|   \____|_|  \__,_|\___|_|\_\ |_|   |_|  \___/
+  ____  ____  _____    ____                _
+ |  _ \|  _ \|  ___|  / ___|_ __ __ _  ___| | _____ _ __
+ | |_) | | | | |_    | |   | '__/ _` |/ __| |/ / _ \ '__|
+ |  __/| |_| |  _|   | |___| | | (_| | (__|   <  __/ |
+ |_|   |____/|_|      \____|_|  \__,_|\___|_|\_\___|_|
 """
 
+# Default characters used in brute-force mode
 DEFAULT_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
-BATCH_SIZE = 1000  # futures submitted per batch to limit memory
 
+# How many passwords to submit to the thread pool at once
+# This prevents loading millions of passwords into memory
+BATCH_SIZE = 1000
+
+# Format for log messages
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
-logger = logging.getLogger("pdfcrack")
+# ===========================
+# Logging Setup
+# ===========================
+
+logger = logging.getLogger("pdfcracker")
 
 
-def _setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> None:
+def setup_logging(verbose=False, log_file=None):
+    """
+    Configure logging for the application.
+    - verbose: if True, show debug-level messages
+    - log_file: optional file path to save logs
+    """
     level = logging.DEBUG if verbose else logging.INFO
     logger.setLevel(level)
 
+    # Console output
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%H:%M:%S"))
     logger.addHandler(console_handler)
 
+    # File output (optional)
     if log_file:
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
@@ -80,21 +101,24 @@ def _setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> Non
         logger.addHandler(file_handler)
 
 
-# ---------------------------------------------------------------------------
-# Console helpers
-# ---------------------------------------------------------------------------
+# ===========================
+# Display Helpers
+# ===========================
 
+# Create a Rich console object if the library is available
 console = Console() if RICH_AVAILABLE else None
 
 
-def _print(msg: str, style: str = "") -> None:
+def display(msg, style=""):
+    """Print a message using Rich if available, otherwise plain print."""
     if console:
         console.print(msg, style=style)
     else:
         print(msg)
 
 
-def _print_banner() -> None:
+def show_banner():
+    """Display the tool's ASCII banner at startup."""
     if console:
         console.print(Panel(Text(BANNER, style="bold cyan"), subtitle=f"v{__version__}"))
     else:
@@ -102,87 +126,121 @@ def _print_banner() -> None:
         print(f"  v{__version__}\n")
 
 
-# ---------------------------------------------------------------------------
-# Progress helper
-# ---------------------------------------------------------------------------
+# ===========================
+# Progress Bar Helper
+# ===========================
 
-def _make_progress(total: Optional[int] = None) -> "Progress | None":
+def create_progress_bar(total=None):
+    """
+    Create a Rich progress bar to show cracking progress.
+    Returns None if Rich is not installed.
+    """
     if not RICH_AVAILABLE:
         return None
-    cols = [
+
+    columns = [
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(bar_width=40),
     ]
     if total:
-        cols.append(MofNCompleteColumn())
-    cols += [
+        columns.append(MofNCompleteColumn())
+    columns += [
         TextColumn("[green]{task.fields[speed]}"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     ]
-    return Progress(*cols, console=console, transient=False)
+    return Progress(*columns, console=console, transient=False)
 
 
-# ---------------------------------------------------------------------------
-# Wordlist utilities
-# ---------------------------------------------------------------------------
+# ===========================
+# Wordlist Utility Functions
+# ===========================
 
-def _count_lines(path: str) -> int:
-    """Fast line count without loading file into memory."""
+def count_lines(filepath):
+    """Count lines in a file without loading it entirely into memory."""
     count = 0
-    with open(path, "rb") as f:
+    with open(filepath, "rb") as f:
         for _ in f:
             count += 1
     return count
 
 
-def _stream_wordlist(path: str) -> Iterator[str]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+def read_wordlist(filepath):
+    """
+    Generator that reads a wordlist file line by line.
+    This avoids loading the entire file into memory which is important
+    for large wordlists like rockyou.txt (14+ million passwords).
+    """
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             word = line.strip()
             if word:
                 yield word
 
 
-# ---------------------------------------------------------------------------
-# Core cracker
-# ---------------------------------------------------------------------------
+# ===========================
+# Main PDFCracker Class
+# ===========================
 
 class PDFCracker:
-    """Multithreaded PDF password recovery engine."""
+    """
+    Main class that handles PDF password cracking.
 
-    def __init__(self, pdf_path: str, threads: int = 8, output: Optional[str] = None):
+    It supports 4 attack modes:
+    1. Dictionary - tries passwords from a wordlist file
+    2. Brute-force - tries all possible character combinations
+    3. Hybrid - combines prefixes/suffixes with dictionary words
+    4. Rules - applies common password mutations to dictionary words
+
+    Uses multithreading to test multiple passwords in parallel.
+    """
+
+    def __init__(self, pdf_path, threads=8, output=None):
+        """
+        Initialize the cracker with the target PDF.
+
+        Args:
+            pdf_path: path to the encrypted PDF file
+            threads: number of worker threads for parallel testing
+            output: optional path for the decrypted output PDF
+        """
         self.pdf_path = pdf_path
         self.threads = threads
         self.output = output
 
-        self.found_password: Optional[str] = None
-        self.stop_event = threading.Event()
-        self.tested = 0
-        self._lock = threading.Lock()
-        self.start_time: float = 0.0
-        self.end_time: float = 0.0
+        # Track cracking state
+        self.found_password = None
+        self.stop_event = threading.Event()  # used to signal all threads to stop
+        self.tested = 0                      # counter for passwords tested
+        self._lock = threading.Lock()        # thread-safe counter updates
+        self.start_time = 0.0
+        self.end_time = 0.0
 
-        # Validate PDF
+        # Check if the PDF file exists
         if not os.path.isfile(pdf_path):
             logger.error("PDF not found: %s", pdf_path)
             sys.exit(1)
 
+        # Check if the PDF is actually encrypted
         size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
         try:
             pikepdf.Pdf.open(pdf_path).close()
-            _print(f"[*] PDF is not encrypted ({size_mb:.1f} MB). Nothing to crack.", style="yellow")
+            display(f"[*] PDF is not encrypted ({size_mb:.1f} MB). Nothing to crack.", style="yellow")
             sys.exit(0)
         except pikepdf.PasswordError:
+            # This is what we want - the PDF is encrypted
             logger.info("PDF is encrypted (%s, %.1f MB). Ready to crack.", pdf_path, size_mb)
         except Exception as exc:
             logger.error("Cannot open PDF: %s", exc)
             sys.exit(1)
 
-    # ---- password test ----------------------------------------------------
-
-    def _test(self, password: str) -> bool:
+    def try_password(self, password):
+        """
+        Test a single password against the PDF.
+        Returns True if the password is correct, False otherwise.
+        """
+        # Check if another thread already found the password
         if self.stop_event.is_set():
             return False
         try:
@@ -195,17 +253,18 @@ class PDFCracker:
             logger.debug("Unexpected error testing '%s': %s", password, exc)
             return False
 
-    # ---- batched parallel runner ------------------------------------------
+    # ----- Core engine that runs passwords in parallel -----
 
-    def _run_batched(
-        self,
-        passwords: Iterator[str],
-        total: Optional[int],
-        description: str,
-    ) -> bool:
-        """Submit passwords in batches, track progress, stop early on success."""
+    def run_attack(self, passwords, total, description):
+        """
+        Run passwords through the thread pool in batches.
 
-        progress = _make_progress(total)
+        This is the core engine used by all attack modes. It:
+        - Submits passwords in batches (to limit memory usage)
+        - Shows a progress bar with speed and ETA
+        - Stops all threads immediately when password is found
+        """
+        progress = create_progress_bar(total)
 
         if progress:
             progress.start()
@@ -213,121 +272,164 @@ class PDFCracker:
 
         try:
             with ThreadPoolExecutor(max_workers=self.threads) as pool:
-                batch: List[Future] = []
+                batch = []
 
                 for pwd in passwords:
                     if self.stop_event.is_set():
                         break
 
-                    future = pool.submit(self._test, pwd)
-                    future._pwd = pwd  # type: ignore[attr-defined]
+                    # Submit password to thread pool
+                    future = pool.submit(self.try_password, pwd)
+                    future._pwd = pwd  # store the password on the future for later retrieval
                     batch.append(future)
 
+                    # Process batch when it's full
                     if len(batch) >= BATCH_SIZE:
-                        if self._drain(batch, progress, task_id if progress else None):
+                        if self._process_batch(batch, progress, task_id if progress else None):
                             return True
                         batch = []
 
-                # drain remaining
+                # Process any remaining passwords
                 if batch and not self.stop_event.is_set():
-                    if self._drain(batch, progress, task_id if progress else None):
+                    if self._process_batch(batch, progress, task_id if progress else None):
                         return True
 
         except KeyboardInterrupt:
             self.stop_event.set()
-            _print("\n[!] Interrupted by user.", style="bold red")
+            display("\n[!] Interrupted by user.", style="bold red")
         finally:
             if progress:
                 progress.stop()
 
         return False
 
-    def _drain(self, futures: List[Future], progress, task_id) -> bool:
+    def _process_batch(self, futures, progress, task_id):
+        """
+        Wait for a batch of futures to complete and check results.
+        Returns True if the password was found.
+        """
         for f in as_completed(futures):
             if self.stop_event.is_set():
                 return False
+
             result = f.result()
+
+            # Update the counter (thread-safe)
             with self._lock:
                 self.tested += 1
                 count = self.tested
 
+            # Update progress bar
             if progress and task_id is not None:
                 elapsed = time.time() - self.start_time
                 speed = count / elapsed if elapsed > 0 else 0
                 progress.update(task_id, advance=1, speed=f"{speed:,.0f} pwd/s")
 
+            # Fallback: print progress every 10,000 passwords if Rich is not available
             if not progress and count % 10000 == 0:
                 elapsed = time.time() - self.start_time
                 speed = count / elapsed if elapsed > 0 else 0
                 print(f"\r  Tested: {count:,}  Speed: {speed:,.0f} pwd/s", end="", flush=True)
 
+            # Check if this password was correct
             if result:
-                self.found_password = f._pwd  # type: ignore[attr-defined]
+                self.found_password = f._pwd
                 self.stop_event.set()
                 return True
+
         return False
 
-    # ---- attack modes -----------------------------------------------------
+    # ----- Attack Mode Implementations -----
 
-    def dictionary_attack(self, wordlist: str) -> bool:
-        total = _count_lines(wordlist)
-        logger.info("Dictionary attack — %s (%s words)", wordlist, f"{total:,}")
-        return self._run_batched(_stream_wordlist(wordlist), total, "Dictionary")
+    def dictionary_attack(self, wordlist):
+        """
+        Dictionary Attack: tries each password from a wordlist file.
+        This is the most common and usually fastest attack mode.
+        """
+        total = count_lines(wordlist)
+        logger.info("Dictionary attack - %s (%s words)", wordlist, f"{total:,}")
+        return self.run_attack(read_wordlist(wordlist), total, "Dictionary")
 
-    def brute_force(self, charset: str, min_len: int, max_len: int) -> bool:
+    def brute_force_attack(self, charset, min_len, max_len):
+        """
+        Brute-Force Attack: tries every possible combination of characters.
+        This guarantees finding the password but can be very slow for long passwords.
+
+        For example, with lowercase + digits (36 chars) and max length 4:
+        Total combinations = 36^1 + 36^2 + 36^3 + 36^4 = 1,727,604
+        """
         total = sum(len(charset) ** i for i in range(min_len, max_len + 1))
-        logger.info("Brute-force — charset[%d] len[%d-%d] (%s combos)",
+        logger.info("Brute-force - charset[%d] len[%d-%d] (%s combos)",
                      len(charset), min_len, max_len, f"{total:,}")
 
-        def gen() -> Iterator[str]:
+        def generate():
             for length in range(min_len, max_len + 1):
                 for combo in product(charset, repeat=length):
                     if self.stop_event.is_set():
                         return
                     yield "".join(combo)
 
-        return self._run_batched(gen(), total, "Brute-force")
+        return self.run_attack(generate(), total, "Brute-force")
 
-    def hybrid_attack(self, wordlist: str, prefixes: List[str], suffixes: List[str]) -> bool:
-        base_count = _count_lines(wordlist)
+    def hybrid_attack(self, wordlist, prefixes, suffixes):
+        """
+        Hybrid Attack: combines dictionary words with prefixes and suffixes.
+        For example: "admin" + "password" + "123" = "adminpassword123"
+
+        This is useful because many people create passwords by combining
+        a common word with numbers or symbols.
+        """
+        base_count = count_lines(wordlist)
         total = base_count * (len(prefixes) + 1) * (len(suffixes) + 1)
-        logger.info("Hybrid attack — %s combos", f"{total:,}")
+        logger.info("Hybrid attack - %s combos", f"{total:,}")
 
-        def gen() -> Iterator[str]:
-            for word in _stream_wordlist(wordlist):
+        def generate():
+            for word in read_wordlist(wordlist):
                 for pre in [""] + prefixes:
                     for suf in [""] + suffixes:
                         if self.stop_event.is_set():
                             return
                         yield pre + word + suf
 
-        return self._run_batched(gen(), total, "Hybrid")
+        return self.run_attack(generate(), total, "Hybrid")
 
-    def rules_attack(self, wordlist: str) -> bool:
+    def rules_attack(self, wordlist):
+        """
+        Rules-Based Attack: applies common password mutations to dictionary words.
+
+        People often modify real words to create passwords, like:
+        - "password" -> "PASSWORD" (uppercase)
+        - "password" -> "password123" (append numbers)
+        - "password" -> "p@ssw0rd" (leet speak)
+
+        This attack tries these common patterns automatically.
+        """
+        # Define mutation rules as lambda functions
         rules = [
-            lambda x: x,
-            lambda x: x.upper(),
-            lambda x: x.lower(),
-            lambda x: x.capitalize(),
-            lambda x: x.title(),
-            lambda x: x[::-1],
-            lambda x: x + "123",
-            lambda x: x + "1234",
-            lambda x: x + "!",
-            lambda x: x + "@",
-            lambda x: x + "2024",
-            lambda x: x + "2025",
-            lambda x: x.replace("a", "@").replace("e", "3").replace("o", "0"),
-            lambda x: x[0].upper() + x[1:] if len(x) > 1 else x.upper(),
-            lambda x: x + x[-1] * 2 if x else x,
+            lambda x: x,                    # original word
+            lambda x: x.upper(),            # UPPERCASE
+            lambda x: x.lower(),            # lowercase
+            lambda x: x.capitalize(),       # Capitalize
+            lambda x: x.title(),            # Title Case
+            lambda x: x[::-1],              # reversed
+            lambda x: x + "123",            # append 123
+            lambda x: x + "1234",           # append 1234
+            lambda x: x + "!",              # append !
+            lambda x: x + "@",              # append @
+            lambda x: x + "2024",           # append year
+            lambda x: x + "2025",           # append year
+            lambda x: x.replace("a", "@").replace("e", "3").replace("o", "0"),  # leet speak
+            lambda x: x[0].upper() + x[1:] if len(x) > 1 else x.upper(),       # first letter caps
+            lambda x: x + x[-1] * 2 if x else x,  # repeat last char
         ]
-        base_count = _count_lines(wordlist)
+
+        base_count = count_lines(wordlist)
         total = base_count * len(rules)
-        logger.info("Rules attack — %d rules x %s words = %s combos",
+        logger.info("Rules attack - %d rules x %s words = %s combos",
                      len(rules), f"{base_count:,}", f"{total:,}")
 
-        def gen() -> Iterator[str]:
-            for word in _stream_wordlist(wordlist):
+        def generate():
+            for word in read_wordlist(wordlist):
                 for rule in rules:
                     if self.stop_event.is_set():
                         return
@@ -336,33 +438,31 @@ class PDFCracker:
                     except Exception:
                         continue
 
-        return self._run_batched(gen(), total, "Rules")
+        return self.run_attack(generate(), total, "Rules")
 
-    # ---- orchestrator -----------------------------------------------------
+    # ----- Main crack method -----
 
-    def crack(
-        self,
-        mode: str = "dict",
-        wordlist: Optional[str] = None,
-        charset: str = DEFAULT_CHARSET,
-        min_len: int = 1,
-        max_len: int = 4,
-        prefixes: Optional[List[str]] = None,
-        suffixes: Optional[List[str]] = None,
-    ) -> bool:
+    def crack(self, mode="dict", wordlist=None, charset=DEFAULT_CHARSET,
+              min_len=1, max_len=4, prefixes=None, suffixes=None):
+        """
+        Main method to start the cracking process.
+        Selects the appropriate attack mode and runs it.
+        """
         self.start_time = time.time()
-        _print_banner()
+        show_banner()
 
-        _print(f"[*] Target   : {self.pdf_path}", style="bold")
-        _print(f"[*] Mode     : {mode.upper()}", style="bold")
-        _print(f"[*] Threads  : {self.threads}", style="bold")
-        _print("")
+        # Display target info
+        display(f"[*] Target   : {self.pdf_path}", style="bold")
+        display(f"[*] Mode     : {mode.upper()}", style="bold")
+        display(f"[*] Threads  : {self.threads}", style="bold")
+        display("")
 
         success = False
+
         if mode == "dict":
             success = self.dictionary_attack(wordlist or "rockyou.txt")
         elif mode == "brute":
-            success = self.brute_force(charset, min_len, max_len)
+            success = self.brute_force_attack(charset, min_len, max_len)
         elif mode == "hybrid":
             success = self.hybrid_attack(
                 wordlist or "rockyou.txt",
@@ -375,12 +475,14 @@ class PDFCracker:
         self.end_time = time.time()
         return success
 
-    # ---- reporting --------------------------------------------------------
+    # ----- Report Generation -----
 
-    def report(self, json_path: Optional[str] = None) -> None:
+    def print_report(self, json_path=None):
+        """Print a summary of the cracking attempt and optionally save as JSON."""
         elapsed = self.end_time - self.start_time
         speed = self.tested / elapsed if elapsed > 0 else 0
 
+        # Display report using Rich table or plain text
         if RICH_AVAILABLE:
             table = Table(title="Cracking Report", show_header=False, border_style="bright_cyan")
             table.add_column("Key", style="bold")
@@ -388,7 +490,7 @@ class PDFCracker:
 
             status = "[bold green]CRACKED" if self.found_password else "[bold red]FAILED"
             table.add_row("Status", status)
-            table.add_row("Password", self.found_password or "—")
+            table.add_row("Password", self.found_password or "-")
             table.add_row("Tested", f"{self.tested:,}")
             table.add_row("Speed", f"{speed:,.0f} passwords/sec")
             table.add_row("Elapsed", f"{elapsed:.2f}s")
@@ -399,17 +501,17 @@ class PDFCracker:
             print("  CRACKING REPORT")
             print(f"{'=' * 55}")
             print(f"  Status   : {'CRACKED' if self.found_password else 'FAILED'}")
-            print(f"  Password : {self.found_password or '—'}")
+            print(f"  Password : {self.found_password or '-'}")
             print(f"  Tested   : {self.tested:,}")
             print(f"  Speed    : {speed:,.0f} passwords/sec")
             print(f"  Elapsed  : {elapsed:.2f}s")
             print(f"{'=' * 55}")
 
-        # Save decrypted PDF
+        # Save the decrypted PDF if password was found
         if self.found_password:
             self._save_decrypted()
 
-        # JSON report
+        # Optionally save report as JSON
         if json_path:
             data = {
                 "status": "cracked" if self.found_password else "failed",
@@ -422,7 +524,8 @@ class PDFCracker:
             Path(json_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
             logger.info("JSON report saved to %s", json_path)
 
-    def _save_decrypted(self) -> None:
+    def _save_decrypted(self):
+        """Save a decrypted copy of the PDF after cracking."""
         try:
             pdf = pikepdf.Pdf.open(self.pdf_path, password=self.found_password)
             out = self.output or str(
@@ -430,19 +533,20 @@ class PDFCracker:
             )
             pdf.save(out)
             pdf.close()
-            _print(f"\n[+] Decrypted PDF saved: {out}", style="bold green")
+            display(f"\n[+] Decrypted PDF saved: {out}", style="bold green")
         except Exception as exc:
             logger.error("Could not save decrypted PDF: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ===========================
+# Command-Line Interface
+# ===========================
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser():
+    """Build the argument parser for the CLI."""
     parser = argparse.ArgumentParser(
-        prog="pdfcrack-pro",
-        description="PDFCrack Pro — Professional PDF Password Recovery Tool",
+        prog="pdf-cracker",
+        description="PDF Password Cracker - Recover passwords from encrypted PDF files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -457,16 +561,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--mode", choices=["dict", "brute", "hybrid", "rules"],
                         default="dict", help="Attack mode (default: dict)")
     parser.add_argument("-w", "--wordlist", default=None,
-                        help="Path to wordlist (default: rockyou.txt)")
+                        help="Path to wordlist file (default: rockyou.txt)")
     parser.add_argument("-c", "--charset", default=DEFAULT_CHARSET,
-                        help="Charset for brute-force mode")
+                        help="Character set for brute-force mode")
     parser.add_argument("-l", "--min-len", type=int, default=1,
                         help="Min password length for brute-force (default: 1)")
     parser.add_argument("-L", "--max-len", type=int, default=4,
                         help="Max password length for brute-force (default: 4)")
     parser.add_argument("-t", "--threads", type=int,
                         default=min(32, (os.cpu_count() or 4) * 2),
-                        help="Worker threads (default: auto)")
+                        help="Number of worker threads (default: auto)")
     parser.add_argument("-p", "--prefixes", nargs="+", default=[],
                         help="Prefixes for hybrid mode")
     parser.add_argument("-s", "--suffixes", nargs="+", default=[],
@@ -474,42 +578,44 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", default=None,
                         help="Output path for decrypted PDF")
     parser.add_argument("--json", default=None, metavar="FILE",
-                        help="Save report as JSON to FILE")
+                        help="Save report as JSON file")
     parser.add_argument("--log", default=None, metavar="FILE",
-                        help="Write log to FILE")
+                        help="Save logs to file")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Verbose / debug output")
+                        help="Show detailed debug output")
     parser.add_argument("-V", "--version", action="version",
                         version=f"%(prog)s {__version__}")
 
     return parser
 
 
-def main() -> None:
-    parser = _build_parser()
+def main():
+    """Entry point of the application."""
+    parser = build_parser()
     args = parser.parse_args()
 
-    _setup_logging(verbose=args.verbose, log_file=args.log)
+    # Setup logging
+    setup_logging(verbose=args.verbose, log_file=args.log)
 
-    # Validate wordlist for modes that need it
+    # Make sure wordlist exists for modes that need it
     if args.mode in ("dict", "hybrid", "rules"):
         wl = args.wordlist or "rockyou.txt"
         if not os.path.isfile(wl):
             logger.error("Wordlist not found: %s", wl)
             sys.exit(1)
 
-    # Graceful shutdown on Ctrl+C
+    # Setup Ctrl+C handler for clean shutdown
     original_sigint = signal.getsignal(signal.SIGINT)
-
     cracker = PDFCracker(args.pdf, threads=args.threads, output=args.output)
 
-    def _handler(_sig, _frame):
+    def handle_interrupt(_sig, _frame):
         cracker.stop_event.set()
-        _print("\n[!] Shutting down gracefully...", style="bold red")
-        signal.signal(signal.SIGINT, original_sigint)  # re-raise on double Ctrl+C
+        display("\n[!] Shutting down gracefully...", style="bold red")
+        signal.signal(signal.SIGINT, original_sigint)
 
-    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGINT, handle_interrupt)
 
+    # Run the cracker
     cracker.crack(
         mode=args.mode,
         wordlist=args.wordlist,
@@ -520,7 +626,8 @@ def main() -> None:
         suffixes=args.suffixes or None,
     )
 
-    cracker.report(json_path=args.json)
+    # Show results
+    cracker.print_report(json_path=args.json)
 
 
 if __name__ == "__main__":
